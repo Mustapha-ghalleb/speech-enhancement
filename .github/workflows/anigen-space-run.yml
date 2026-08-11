@@ -11,12 +11,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Inspect YaHooHoo AniGen API
+      - name: Warm mirror and inspect source
+        run: |
+          set -euxo pipefail
+          curl -L --retry 3 --connect-timeout 20 --max-time 180 -o mirror-config.json https://yahoohoo-anigen.hf.space/config || true
+          wc -c mirror-config.json || true
+          head -c 500 mirror-config.json || true
+          echo
+          GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 https://huggingface.co/spaces/YaHooHoo/AniGen mirror
+          grep -nE 'def |\.click\(|Interface|Blocks|api_name|generate|process' mirror/app.py | tail -n 120 || true
+
+      - name: Inspect API with long timeout
         run: |
           set -euxo pipefail
           python -m pip install --quiet --upgrade gradio_client
           python - <<'PY'
           from gradio_client import Client
-          c = Client('YaHooHoo/AniGen')
+          c = Client('YaHooHoo/AniGen', httpx_kwargs={'timeout': 180.0})
           print(c.view_api(all_endpoints=True, print_info=True))
           PY
