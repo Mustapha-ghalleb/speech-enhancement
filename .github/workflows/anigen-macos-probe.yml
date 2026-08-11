@@ -10,18 +10,17 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 15
     steps:
-      - name: Probe Apple Silicon and Metal
+      - name: Probe MPS in virtualenv
         run: |
           set -euxo pipefail
-          uname -a
           uname -m
-          sw_vers
           sysctl -n hw.memsize
-          system_profiler SPHardwareDataType
           system_profiler SPDisplaysDataType || true
-          xcrun -sdk macosx metal --version || true
-          python3 -m pip install --quiet --user torch
-          python3 - <<'PY'
+          python3 -m venv .venv
+          source .venv/bin/activate
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet torch
+          python - <<'PY'
           import torch
           print('torch', torch.__version__)
           print('MPS built', torch.backends.mps.is_built())
