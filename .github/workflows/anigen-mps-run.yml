@@ -1,0 +1,228 @@
+name: AniGen Staged MPS Run
+
+on:
+  push:
+    paths:
+      - '.github/workflows/anigen-mps-run.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      PIP_NO_CACHE_DIR: "1"
+      PYTORCH_ENABLE_MPS_FALLBACK: "1"
+      PYTORCH_MPS_HIGH_WATERMARK_RATIO: "0.0"
+      ANIGEN_ATTN_KEY_CHUNK: "1024"
+    steps:
+      - name: Prepare AniGen Mac environment
+        run: |
+          set -euxo pipefail
+          sudo xcode-select -s /Applications/Xcode_26.3.app/Contents/Developer || true
+          xcrun -sdk macosx metal --version
+          git clone --depth 1 https://github.com/pawel-mazurkiewicz/AniGen-mac.git AniGen
+          cd AniGen
+          python3 -m venv .venv
+          source .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-mac.txt
+          python -m pip install ./extern/mtlbvh
+          python -m pip install ./extern/mtlgemm ./extern/mtldiffrast ./extern/mtlmesh
+          rm -rf ~/Library/Caches/pip ~/.cache/pip || true
+          python - <<'PY'
+          import torch, anigen_mps
+          print('torch', torch.__version__)
+          print('MPS', torch.backends.mps.is_available())
+          import flex_gemm, mtldiffrast, cumesh, mtlbvh
+          print('Metal backends OK')
+          PY
+          df -h .
+
+      - name: Run staged AniGen inference
+        working-directory: AniGen
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+          cat > staged_mps.py <<'PY'
+          import os, gc, json, shutil, types
+          from pathlib import Path
+          import numpy as np
+          import torch
+          from PIL import Image
+          from easydict import EasyDict as edict
+          from huggingface_hub import snapshot_download
+
+          import anigen_mps
+          from anigen import models
+          from anigen.pipelines.anigen_image_to_3d import AnigenImageTo3DPipeline
+          from anigen.utils.image_utils import load_dsine
+          from anigen.utils.skin_utils import repair_skeleton_parents
+          from anigen.utils.export_utils import convert_to_glb_from_data, _extract_vertex_rgb, visualize_skeleton_as_mesh
+          import trimesh
+
+          DEV=torch.device('mps')
+          REPO='VAST-AI/AniGen'
+          ROOT=Path('.')
+          OUT=ROOT/'results_staged'/'trex'
+          OUT.mkdir(parents=True,exist_ok=True)
+
+          def mem(tag):
+              try:
+                  print(f'[MEM] {tag}: allocated={torch.mps.current_allocated_memory()/1e9:.2f}GB driver={torch.mps.driver_allocated_memory()/1e9:.2f}GB', flush=True)
+              except Exception as e:
+                  print('[MEM]',tag,e,flush=True)
+
+          def clean(*objs):
+              for o in objs:
+                  try: del o
+                  except Exception: pass
+              gc.collect()
+              try: torch.mps.empty_cache()
+              except Exception: pass
+
+          def fetch(patterns):
+              print('FETCH', patterns, flush=True)
+              snapshot_download(repo_id=REPO, repo_type='model', allow_patterns=patterns, local_dir='.', max_workers=8)
+              shutil.rmtree('.cache/huggingface', ignore_errors=True)
+
+          def cpu_dict(d):
+              return {k:(v.detach().cpu() if torch.is_tensor(v) else v) for k,v in d.items()}
+          def dev_dict(d):
+              return {k:(v.to(DEV) if torch.is_tensor(v) else v) for k,v in d.items()}
+
+          def upcast(m):
+              anigen_mps.upcast_pipeline_fp32(types.SimpleNamespace(models={'model':m}))
+              return m
+
+          def load_cfg(path):
+              with open(Path(path)/'config.json') as f: return edict(json.load(f))
+
+          def select_pt(path):
+              pts=[p for p in (Path(path)/'ckpts').glob('*.pt') if 'ema' not in p.name and 'misc' not in p.name]
+              if not pts: raise RuntimeError(f'no checkpoint in {path}')
+              return sorted(pts)[0]
+
+          def load_flow(path):
+              cfg=load_cfg(path)
+              mc=cfg.models.denoiser
+              print('Instantiate',mc.name,flush=True)
+              m=getattr(models,mc.name)(**mc.args)
+              ck=select_pt(path)
+              print('mmap load',ck,flush=True)
+              sd=torch.load(ck,map_location='cpu',mmap=True,weights_only=True)
+              try: m.load_state_dict(sd,strict=False,assign=True)
+              except TypeError: m.load_state_dict(sd,strict=False)
+              del sd; gc.collect()
+              m.to(DEV).eval(); upcast(m); mem(f'loaded {path}')
+              return m,cfg
+
+          def load_decoder(path, ckpt='final'):
+              cfg=load_cfg(path)
+              mc=edict(cfg.models.decoder)
+              print('Instantiate decoder',mc.name,flush=True)
+              m=getattr(models,mc.name)(**mc.args)
+              ck=Path(path)/'ckpts'/f'decoder_{ckpt}.pt'
+              sd=torch.load(ck,map_location='cpu',mmap=True,weights_only=True)
+              try: m.load_state_dict(sd,strict=False,assign=True)
+              except TypeError: m.load_state_dict(sd,strict=False)
+              del sd; gc.collect()
+              m.to(DEV).eval(); upcast(m); mem(f'loaded decoder {path}')
+              return m
+
+          torch.manual_seed(42); np.random.seed(42)
+          src=Image.open('assets/cond_images/trex.png')
+
+          # Stage A: DSINE + foreground processing.
+          fetch(['ckpts/dsine/**'])
+          print('STAGE DSINE',flush=True)
+          ds=load_dsine(DEV)
+          pipe=AnigenImageTo3DPipeline({'dsine':ds},None,None)
+          processed, normal=pipe.preprocess_image(src)
+          processed.save(OUT/'processed_image.png'); normal.save(OUT/'processed_normal.png')
+          del pipe, ds
+          clean()
+          shutil.rmtree('ckpts/dsine',ignore_errors=True)
+          shutil.rmtree(os.path.expanduser('~/.u2net'),ignore_errors=True)
+          mem('after DSINE free')
+
+          # Stage B: DINO conditioning.
+          fetch(['ckpts/dinov2/**'])
+          print('STAGE DINO',flush=True)
+          dino=torch.hub.load('./ckpts/dinov2','dinov2_vitl14_reg',pretrained=True,source='local').to(DEV).eval().float()
+          pipe=AnigenImageTo3DPipeline({'image_cond_model':dino},None,None)
+          cond_ss,cond_slat=pipe.get_cond(processed,normal)
+          cond_ss=cpu_dict(cond_ss); cond_slat=cpu_dict(cond_slat)
+          del pipe,dino
+          clean()
+          shutil.rmtree('ckpts/dinov2',ignore_errors=True)
+          mem('after DINO free')
+
+          # Stage C: Sparse Structure.
+          fetch([
+              'ckpts/anigen/ss_flow_solo/**',
+              'ckpts/anigen/ss_dae/config.json',
+              'ckpts/anigen/ss_dae/ckpts/decoder_final.pt',
+          ])
+          print('STAGE SS',flush=True)
+          ss,sscfg=load_flow('ckpts/anigen/ss_flow_solo')
+          ssd=load_decoder('ckpts/anigen/ss_dae','final')
+          pipe=AnigenImageTo3DPipeline({'ss_flow_model':ss,'ss_decoder':ssd},sscfg,None)
+          css=dev_dict(cond_ss); del cond_ss
+          coords,coords_skl,d0,d1=pipe.sample_sparse_structure(css,strength=7.5,steps=8)
+          coords_cpu=coords.detach().cpu(); coords_skl_cpu=coords_skl.detach().cpu()
+          del css,coords,coords_skl,d0,d1,pipe,ss,ssd
+          clean()
+          shutil.rmtree('ckpts/anigen/ss_flow_solo',ignore_errors=True)
+          shutil.rmtree('ckpts/anigen/ss_dae',ignore_errors=True)
+          mem('after SS free')
+
+          # Stage D: Structured latent + decode.
+          fetch([
+              'ckpts/anigen/slat_flow_auto/**',
+              'ckpts/anigen/slat_dae/config.json',
+              'ckpts/anigen/slat_dae/ckpts/decoder_final.pt',
+          ])
+          print('STAGE SLAT',flush=True)
+          slat,slcfg=load_flow('ckpts/anigen/slat_flow_auto')
+          slatd=load_decoder('ckpts/anigen/slat_dae','final')
+          pipe=AnigenImageTo3DPipeline({'slat_flow_model':slat,'slat_decoder':slatd},None,slcfg)
+          csl=dev_dict(cond_slat); del cond_slat
+          coords=coords_cpu.to(DEV); coords_skl=coords_skl_cpu.to(DEV)
+          z,zsk=pipe.sample_slat(csl,coords,coords_skl,strength=3.0,steps=8,joint_density=1)
+          mesh_result,skel_result=pipe.decode_slat(z,zsk)
+          print('DECODE COMPLETE',flush=True); mem('decoded')
+
+          joints=skel_result.joints_grouped.detach().cpu().numpy()
+          parents=skel_result.parents_grouped.detach().cpu().numpy().astype(np.int32)
+          skin=skel_result.skin_pred.detach().cpu().numpy()
+          verts=mesh_result.vertices.detach().cpu().numpy()
+          faces=mesh_result.faces.detach().cpu().numpy()
+          colors=_extract_vertex_rgb(getattr(mesh_result,'vertex_attrs',None))
+          if torch.is_tensor(colors): colors=colors.detach().cpu().numpy()
+          del pipe,slat,slatd,z,zsk,mesh_result,skel_result,csl,coords,coords_skl
+          clean(); mem('after SLAT free')
+
+          # Lightweight CPU export: no texture bake, no mesh decimation.
+          parents=repair_skeleton_parents(joints=joints,parents=parents,verbose=True).astype(np.int32)
+          mesh=trimesh.Trimesh(vertices=verts,faces=faces,process=False)
+          convert_to_glb_from_data(mesh,joints,parents,skin,str(OUT/'mesh.glb'),vertex_colors=colors,texture_image=None)
+          skmesh=visualize_skeleton_as_mesh(joints,parents)
+          if len(skmesh.vertices)>0: skmesh.export(OUT/'skeleton.glb')
+          print('SUCCESS OUTPUTS',flush=True)
+          for p in sorted(OUT.iterdir()): print(p,p.stat().st_size,flush=True)
+          PY
+          python staged_mps.py
+          df -h .
+
+      - name: Publish AniGen outputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: AniGen
+        run: |
+          set -euxo pipefail
+          TAG="anigen-mps-${GITHUB_RUN_ID}"
+          gh release create "$TAG" results_staged/trex/* --repo "$GITHUB_REPOSITORY" --title "AniGen T-Rex MPS ${GITHUB_RUN_ID}" --notes "AniGen generated on GitHub-hosted Apple Silicon MPS. Staged low-memory inference, seed 42, 8+8 sampling steps, no texture bake."
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url,assets
