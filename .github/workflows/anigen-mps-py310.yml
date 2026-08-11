@@ -1,0 +1,84 @@
+name: AniGen MPS Python 3.10 Run
+
+on:
+  push:
+    paths:
+      - '.github/workflows/anigen-mps-py310.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      PIP_NO_CACHE_DIR: "1"
+      PYTORCH_ENABLE_MPS_FALLBACK: "1"
+      PYTORCH_MPS_HIGH_WATERMARK_RATIO: "0.0"
+      ANIGEN_ATTN_KEY_CHUNK: "1024"
+    steps:
+      - name: Checkout runner scripts
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10 arm64
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          architecture: 'arm64'
+
+      - name: Extract staged inference script
+        run: |
+          set -euxo pipefail
+          python --version
+          python -c "import platform; print(platform.machine())"
+          sed -n "/cat > staged_mps.py <<'PY'/,/^          PY$/p" .github/workflows/anigen-mps-run.yml \
+            | sed '1d;$d;s/^          //' > /tmp/staged_mps.py
+          test -s /tmp/staged_mps.py
+          head -n 5 /tmp/staged_mps.py
+          tail -n 5 /tmp/staged_mps.py
+
+      - name: Prepare AniGen Mac environment
+        run: |
+          set -euxo pipefail
+          sudo xcode-select -s /Applications/Xcode_26.3.app/Contents/Developer || true
+          xcrun -sdk macosx metal --version
+          git clone --depth 1 https://github.com/pawel-mazurkiewicz/AniGen-mac.git AniGen
+          cd AniGen
+          python -m venv .venv
+          source .venv/bin/activate
+          python --version
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-mac.txt
+          python -m pip install ./extern/mtlbvh
+          python -m pip install ./extern/mtlgemm ./extern/mtldiffrast ./extern/mtlmesh
+          rm -rf ~/Library/Caches/pip ~/.cache/pip || true
+          python - <<'PY'
+          import torch, anigen_mps
+          print('torch', torch.__version__)
+          print('MPS built', torch.backends.mps.is_built())
+          print('MPS available', torch.backends.mps.is_available())
+          import flex_gemm, mtldiffrast, cumesh, mtlbvh
+          print('Metal backends OK')
+          assert torch.backends.mps.is_available()
+          PY
+          df -h .
+
+      - name: Run staged AniGen inference
+        working-directory: AniGen
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+          cp /tmp/staged_mps.py ./staged_mps.py
+          python staged_mps.py
+          df -h .
+
+      - name: Publish AniGen outputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: AniGen
+        run: |
+          set -euxo pipefail
+          TAG="anigen-mps-${GITHUB_RUN_ID}"
+          gh release create "$TAG" results_staged/trex/* --repo "$GITHUB_REPOSITORY" --title "AniGen T-Rex MPS ${GITHUB_RUN_ID}" --notes "AniGen generated on GitHub-hosted Apple Silicon MPS. Staged low-memory inference, seed 42, 8+8 sampling steps, no texture bake."
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url,assets
