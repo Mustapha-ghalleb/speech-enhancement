@@ -50,8 +50,8 @@ jobs:
           python --version
           python -m pip install --upgrade pip
           python -m pip install -r requirements-mac.txt
-          python -m pip install ./extern/mtlbvh
-          python -m pip install ./extern/mtlgemm ./extern/mtldiffrast ./extern/mtlmesh
+          python -m pip install --no-build-isolation ./extern/mtlbvh
+          python -m pip install --no-build-isolation ./extern/mtlgemm ./extern/mtldiffrast ./extern/mtlmesh
           rm -rf ~/Library/Caches/pip ~/.cache/pip || true
           python - <<'PY'
           import torch, anigen_mps
