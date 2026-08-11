@@ -6,27 +6,78 @@ on:
       - '.github/workflows/anigen-space-run.yml'
   workflow_dispatch:
 
-jobs:
-  inspect-mirror:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - name: Warm mirror and inspect source
-        run: |
-          set -euxo pipefail
-          curl -L --retry 3 --connect-timeout 20 --max-time 180 -o mirror-config.json https://yahoohoo-anigen.hf.space/config || true
-          wc -c mirror-config.json || true
-          head -c 500 mirror-config.json || true
-          echo
-          GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 https://huggingface.co/spaces/YaHooHoo/AniGen mirror
-          grep -nE 'def |\.click\(|Interface|Blocks|api_name|generate|process' mirror/app.py | tail -n 120 || true
+permissions:
+  contents: write
 
-      - name: Inspect API with long timeout
+jobs:
+  run-mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Prepare client and T-Rex sample
         run: |
           set -euxo pipefail
           python -m pip install --quiet --upgrade gradio_client
+          curl -L --fail --retry 5 -o trex.png https://raw.githubusercontent.com/VAST-AI-Research/AniGen/main/assets/cond_images/trex.png
+          mkdir -p anigen-output
+
+      - name: Run AniGen mirror
+        run: |
+          set -euxo pipefail
           python - <<'PY'
-          from gradio_client import Client
-          c = Client('YaHooHoo/AniGen', httpx_kwargs={'timeout': 180.0})
-          print(c.view_api(all_endpoints=True, print_info=True))
+          import os, shutil, traceback
+          from pathlib import Path
+          from gradio_client import Client, handle_file
+
+          out = Path('anigen-output')
+          client = Client('YaHooHoo/AniGen', httpx_kwargs={'timeout': 180.0})
+          print('API connected', flush=True)
+          try:
+              client.predict(api_name='/start_session')
+          except Exception as e:
+              print('start_session:', repr(e), flush=True)
+
+          processed = client.predict(handle_file('trex.png'), api_name='/prepare_input_for_generation')
+          print('PREPARED:', repr(processed), flush=True)
+          if isinstance(processed, str) and os.path.isfile(processed):
+              shutil.copy2(processed, out / ('processed' + (Path(processed).suffix or '.png')))
+
+          preview = client.predict(
+              42, 'ss_flow_solo', 'slat_flow_auto',
+              7.5, 25, 3.0, 25, 1.0,
+              api_name='/generate_preview'
+          )
+          print('PREVIEW:', repr(preview), flush=True)
+          if isinstance(preview, (tuple, list)):
+              for i, item in enumerate(preview):
+                  if isinstance(item, str) and os.path.isfile(item):
+                      shutil.copy2(item, out / f'preview_{i}{Path(item).suffix or ".bin"}')
+
+          try:
+              extracted = client.predict(1024, 0.95, True, api_name='/extract_glb')
+              print('EXTRACTED:', repr(extracted), flush=True)
+              if isinstance(extracted, (tuple, list)):
+                  for i, item in enumerate(extracted):
+                      if isinstance(item, str) and os.path.isfile(item):
+                          name = ['mesh','skeleton','result'][i] if i < 3 else f'output_{i}'
+                          shutil.copy2(item, out / f'{name}{Path(item).suffix or ".bin"}')
+          except Exception as e:
+              print('EXTRACT_FAILED:', repr(e), flush=True)
+              traceback.print_exc()
+
+          print('OUTPUT FILES', flush=True)
+          for p in sorted(out.iterdir()):
+              print(p, p.stat().st_size, flush=True)
+          if not any(out.iterdir()):
+              raise RuntimeError('AniGen produced no files')
           PY
+
+      - name: Publish outputs
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          TAG="anigen-trex-${GITHUB_RUN_ID}"
+          gh release create "$TAG" anigen-output/* --repo "$GITHUB_REPOSITORY" --title "AniGen T-Rex ${GITHUB_RUN_ID}" --notes "AniGen run using YaHooHoo/AniGen mirror, ss_flow_solo + slat_flow_auto, seed 42."
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url,assets
