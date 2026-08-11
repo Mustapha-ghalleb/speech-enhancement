@@ -41,19 +41,7 @@ jobs:
             shift
             rm -rf hfstage
             mkdir -p hfstage
-            python - "$@" <<'PY'
-import sys
-from huggingface_hub import snapshot_download
-patterns = sys.argv[1:]
-print('Downloading patterns:', patterns, flush=True)
-snapshot_download(
-    repo_id='VAST-AI/AniGen',
-    repo_type='model',
-    allow_patterns=patterns,
-    local_dir='hfstage',
-    max_workers=8,
-)
-PY
+            python -c "import sys; from huggingface_hub import snapshot_download; p=sys.argv[1:]; print('Downloading patterns:', p, flush=True); snapshot_download(repo_id='VAST-AI/AniGen', repo_type='model', allow_patterns=p, local_dir='hfstage', max_workers=8)" "$@"
             rm -rf hfstage/.cache
             local archive="${label}.tar"
             tar -cf "$archive" -C hfstage .
