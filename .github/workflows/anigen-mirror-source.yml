@@ -1,0 +1,20 @@
+name: Inspect AniGen Mirror Source
+
+on:
+  push:
+    paths:
+      - '.github/workflows/anigen-mirror-source.yml'
+
+jobs:
+  inspect-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Clone source without LFS and inspect app
+        run: |
+          set -euxo pipefail
+          GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 https://huggingface.co/spaces/YaHooHoo/AniGen mirror
+          echo '=== app.py key lines ==='
+          grep -nE 'def |\.click\(|Interface|Blocks|api_name|generate|process|launch' mirror/app.py | tail -n 180 || true
+          echo '=== app.py tail ==='
+          tail -n 180 mirror/app.py
