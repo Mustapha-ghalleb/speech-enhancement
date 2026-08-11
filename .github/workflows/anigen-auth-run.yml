@@ -1,0 +1,65 @@
+name: AniGen Authenticated Run
+
+on:
+  push:
+    paths:
+      - '.github/workflows/anigen-auth-run.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      HF_TOKEN_A: ${{ secrets.HF_TOKEN }}
+      HF_TOKEN_B: ${{ secrets.HUGGINGFACE_TOKEN }}
+      HF_TOKEN_C: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
+    steps:
+      - name: Check token and prepare
+        run: |
+          set -euo pipefail
+          TOKEN="${HF_TOKEN_A:-${HF_TOKEN_B:-${HF_TOKEN_C:-}}}"
+          if [ -z "$TOKEN" ]; then echo 'NO_HF_TOKEN_SECRET'; exit 3; fi
+          echo 'HF_TOKEN_SECRET_FOUND'
+          python -m pip install --quiet --upgrade gradio_client
+          curl -L --fail -o trex.png https://raw.githubusercontent.com/VAST-AI-Research/AniGen/main/assets/cond_images/trex.png
+          mkdir -p anigen-output
+
+      - name: Run official AniGen authenticated
+        run: |
+          set -euo pipefail
+          TOKEN="${HF_TOKEN_A:-${HF_TOKEN_B:-${HF_TOKEN_C:-}}}"
+          python - <<'PY'
+          import os, shutil, traceback
+          from pathlib import Path
+          from gradio_client import Client, handle_file
+          token=os.environ.get('HF_TOKEN_A') or os.environ.get('HF_TOKEN_B') or os.environ.get('HF_TOKEN_C')
+          out=Path('anigen-output')
+          c=Client('VAST-AI/AniGen', token=token, httpx_kwargs={'timeout':180.0})
+          try: c.predict(api_name='/start_session')
+          except Exception as e: print('start_session', repr(e), flush=True)
+          p=c.predict(handle_file('trex.png'), api_name='/prepare_input_for_generation')
+          print('PREPARED', repr(p), flush=True)
+          preview=c.predict(42,'ss_flow_solo','slat_flow_auto',7.5,25,3.0,25,1.0,api_name='/generate_preview')
+          print('PREVIEW', repr(preview), flush=True)
+          for i,x in enumerate(preview if isinstance(preview,(tuple,list)) else [preview]):
+              if isinstance(x,str) and os.path.isfile(x): shutil.copy2(x,out/f'preview_{i}{Path(x).suffix or ".bin"}')
+          try:
+              ext=c.predict(1024,0.95,True,api_name='/extract_glb')
+              print('EXTRACTED',repr(ext),flush=True)
+              for i,x in enumerate(ext if isinstance(ext,(tuple,list)) else [ext]):
+                  if isinstance(x,str) and os.path.isfile(x): shutil.copy2(x,out/f'final_{i}{Path(x).suffix or ".bin"}')
+          except Exception as e:
+              print('EXTRACT_FAILED',repr(e),flush=True); traceback.print_exc()
+          if not any(out.iterdir()): raise RuntimeError('No AniGen output files')
+          PY
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="anigen-auth-${GITHUB_RUN_ID}"
+          gh release create "$TAG" anigen-output/* --repo "$GITHUB_REPOSITORY" --title "AniGen authenticated output" --notes "Generated from the official VAST-AI/AniGen Space."
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url,assets
